@@ -1,0 +1,78 @@
+{
+  "address": "Tru5tCha1nL1te11111111111111111111111111111",
+  "metadata": {
+    "name": "trustchain_lite",
+    "version": "0.1.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [
+    {
+      "name": "initializeEscrow",
+      "accounts": [
+        { "name": "client", "writable": true, "signer": true },
+        { "name": "freelancer", "writable": false, "signer": false },
+        { "name": "escrow", "writable": true, "signer": false },
+        { "name": "systemProgram", "writable": false, "signer": false }
+      ],
+      "args": [
+        { "name": "jobId", "type": "u64" },
+        { "name": "amountLamports", "type": "u64" }
+      ]
+    },
+    {
+      "name": "approveAndRelease",
+      "accounts": [
+        { "name": "client", "writable": true, "signer": true },
+        { "name": "freelancer", "writable": true, "signer": false },
+        { "name": "escrow", "writable": true, "signer": false },
+        { "name": "clientReputation", "writable": true, "signer": false },
+        { "name": "freelancerReputation", "writable": true, "signer": false },
+        { "name": "systemProgram", "writable": false, "signer": false }
+      ],
+      "args": [{ "name": "jobId", "type": "u64" }]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "escrow"
+    },
+    {
+      "name": "reputation"
+    }
+  ],
+  "types": [
+    {
+      "name": "escrow",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "client", "type": "pubkey" },
+          { "name": "freelancer", "type": "pubkey" },
+          { "name": "jobId", "type": "u64" },
+          { "name": "amountLamports", "type": "u64" },
+          { "name": "status", "type": { "defined": "escrowStatus" } },
+          { "name": "bump", "type": "u8" }
+        ]
+      }
+    },
+    {
+      "name": "reputation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "user", "type": "pubkey" },
+          { "name": "score", "type": "u64" },
+          { "name": "completedJobs", "type": "u64" }
+        ]
+      }
+    },
+    {
+      "name": "escrowStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [{ "name": "Funded" }, { "name": "Released" }]
+      }
+    }
+  ]
+}
+
