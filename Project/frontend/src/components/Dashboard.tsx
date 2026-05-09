@@ -3,9 +3,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, PublicKey, SystemProgram } from "@solana/web3.js";
 import BN from "bn.js";
 import { escrowPda, reputationPda } from "@/lib/solana/pdas";
+import { TRUSTCHAIN_PROGRAM_ID } from "@/lib/solana/constants";
 import { getTrustchainProgram } from "@/lib/solana/program";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -13,13 +14,18 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { Input } from "@/components/ui/Input";
 import { copyToClipboard, shortKey, solscanAccountUrl, solscanTxUrl } from "@/lib/ui/utils";
 
+type EscrowStatus = "Funded" | "In Progress" | "Released" | "Unknown";
+
 type EscrowView = {
   escrowKey: string;
   client: string;
   freelancer: string;
   jobId: string;
   amountLamports: string;
-  status: "Funded" | "Released" | "Unknown";
+  amountReleasedLamports: string;
+  totalMilestones: number;
+  releasedMilestones: number;
+  status: EscrowStatus;
 };
 
 type ReputationView = {
@@ -32,14 +38,196 @@ type EscrowListItem = EscrowView & {
   role: "Client" | "Freelancer";
 };
 
+type BadgeTone = "neutral" | "success" | "warning" | "danger" | "brand";
+type AnchorNumber = { toString: () => string };
+type AnchorEscrowStatus = {
+  funded?: Record<string, never>;
+  inProgress?: Record<string, never>;
+  released?: Record<string, never>;
+};
+type AnchorEscrowAccount = {
+  client: PublicKey;
+  freelancer: PublicKey;
+  jobId: AnchorNumber;
+  amountLamports: AnchorNumber;
+  amountReleasedLamports?: AnchorNumber;
+  totalMilestones?: number;
+  releasedMilestones?: number;
+  status?: AnchorEscrowStatus;
+};
+type AnchorReputationAccount = {
+  user: PublicKey;
+  score: AnchorNumber;
+  completedJobs: AnchorNumber;
+};
+type RpcBuilder = {
+  accounts: (accounts: Record<string, unknown>) => {
+    rpc: () => Promise<string>;
+  };
+};
+type TrustchainProgramClient = {
+  account: {
+    escrow: {
+      fetchNullable: (publicKey: PublicKey) => Promise<AnchorEscrowAccount | null>;
+      all: (filters: Array<{ memcmp: { offset: number; bytes: string } }>) => Promise<
+        Array<{
+          publicKey: PublicKey;
+          account: AnchorEscrowAccount;
+        }>
+      >;
+    };
+    reputation: {
+      fetchNullable: (publicKey: PublicKey) => Promise<AnchorReputationAccount | null>;
+    };
+  };
+  methods: {
+    initializeEscrow: (jobId: BN, amountLamports: BN, totalMilestones: number) => RpcBuilder;
+    approveMilestone: (jobId: BN) => RpcBuilder;
+  };
+};
+
+const statusTone = (status: EscrowStatus): BadgeTone =>
+  status === "Released" ? "success" : status === "Funded" || status === "In Progress" ? "brand" : "neutral";
+
+const sol = (lamports: string | number) =>
+  (Number(lamports) / LAMPORTS_PER_SOL).toLocaleString(undefined, {
+    maximumFractionDigits: 4,
+    minimumFractionDigits: 0,
+  });
+
+const percent = (released: number, total: number) => {
+  if (!total) return 0;
+  return Math.min(100, Math.round((released / total) * 100));
+};
+
+function readableError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("429") || message.toLowerCase().includes("too many requests")) {
+    return "Solana public Devnet faucet is rate limited right now. Wait a few minutes, use the official Solana faucet, or set NEXT_PUBLIC_SOLANA_RPC_URL to a private Devnet RPC endpoint.";
+  }
+  if (message.toLowerCase().includes("program that does not exist")) {
+    return `TrustChain program is not deployed on Devnet at ${TRUSTCHAIN_PROGRAM_ID.toBase58()}. Deploy the Anchor program first, then update the frontend program id and IDL.`;
+  }
+
+  return message;
+}
+
+function readStatus(status: AnchorEscrowStatus | undefined): EscrowStatus {
+  if (!status) return "Unknown";
+  if ("funded" in status) return "Funded";
+  if ("inProgress" in status) return "In Progress";
+  if ("released" in status) return "Released";
+  return "Unknown";
+}
+
+function mapEscrow(publicKey: PublicKey, account: AnchorEscrowAccount, role?: EscrowListItem["role"]): EscrowView | EscrowListItem {
+  const view: EscrowView = {
+    escrowKey: publicKey.toBase58(),
+    client: account.client.toBase58(),
+    freelancer: account.freelancer.toBase58(),
+    jobId: account.jobId.toString(),
+    amountLamports: account.amountLamports.toString(),
+    amountReleasedLamports: account.amountReleasedLamports?.toString() ?? "0",
+    totalMilestones: Number(account.totalMilestones ?? 1),
+    releasedMilestones: Number(account.releasedMilestones ?? 0),
+    status: readStatus(account.status),
+  };
+
+  return role ? { ...view, role } : view;
+}
+
+function Stat({
+  label,
+  value,
+  helper,
+}: {
+  label: string;
+  value: string;
+  helper: string;
+}) {
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-950/80 p-4 text-white">
+      <div className="text-xs font-medium text-zinc-400">{label}</div>
+      <div className="mt-2 text-2xl font-semibold tracking-tight">{value}</div>
+      <div className="mt-1 text-xs text-zinc-500">{helper}</div>
+    </div>
+  );
+}
+
+function ProgressBar({ released, total }: { released: number; total: number }) {
+  const width = percent(released, total);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between text-xs text-zinc-600">
+        <span>
+          {released} of {total} milestones
+        </span>
+        <span>{width}%</span>
+      </div>
+      <div className="h-2 overflow-hidden rounded-full bg-zinc-100">
+        <div className="h-full rounded-full bg-cyan-500 transition-all" style={{ width: `${width}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function KeyLink({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-lg bg-zinc-50 px-3 py-2 text-xs">
+      <span className="font-medium text-zinc-500">{label}</span>
+      <div className="flex min-w-0 items-center gap-2">
+        <a
+          className="truncate font-mono text-zinc-800 underline underline-offset-4"
+          href={solscanAccountUrl(value)}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {shortKey(value, 6, 6)}
+        </a>
+        <Button size="sm" variant="ghost" onClick={() => copyToClipboard(value).catch(() => {})}>
+          Copy
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ClientWalletButton() {
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setMounted(true);
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  if (!mounted) {
+    return (
+      <button
+        type="button"
+        disabled
+        className="wallet-adapter-button wallet-adapter-button-trigger"
+      >
+        Select Wallet
+      </button>
+    );
+  }
+
+  return <WalletMultiButton />;
+}
+
 export function Dashboard() {
   const { connection } = useConnection();
   const wallet = useWallet();
 
-  const [tab, setTab] = useState<"create" | "my-escrows">("create");
+  const [tab, setTab] = useState<"workbench" | "my-escrows">("workbench");
   const [freelancerAddress, setFreelancerAddress] = useState("");
   const [jobId, setJobId] = useState("1");
-  const [amountSol, setAmountSol] = useState("0.1");
+  const [amountSol, setAmountSol] = useState("0.25");
+  const [totalMilestones, setTotalMilestones] = useState("3");
 
   const [isBusy, setIsBusy] = useState(false);
   const [lastTx, setLastTx] = useState<string | null>(null);
@@ -50,31 +238,69 @@ export function Dashboard() {
   const [freelancerRep, setFreelancerRep] = useState<ReputationView | null>(null);
   const [myEscrows, setMyEscrows] = useState<EscrowListItem[]>([]);
   const [myEscrowsLoading, setMyEscrowsLoading] = useState(false);
+  const [walletBalanceLamports, setWalletBalanceLamports] = useState<number | null>(null);
 
-  const canSend = wallet.connected && wallet.publicKey;
+  const canSend = Boolean(wallet.connected && wallet.publicKey);
 
   const parsed = useMemo(() => {
     try {
-      const freelancer = new PublicKey(freelancerAddress);
+      const freelancer = new PublicKey(freelancerAddress.trim());
       const jobIdBig = BigInt(jobId);
-      const amountLamports = BigInt(Math.round(Number(amountSol) * LAMPORTS_PER_SOL));
-      return { freelancer, jobIdBig, amountLamports };
+      const amount = Number(amountSol);
+      const milestones = Number(totalMilestones);
+
+      if (!Number.isFinite(amount) || amount <= 0) return null;
+      if (!Number.isInteger(milestones) || milestones < 1 || milestones > 20) return null;
+      if (jobIdBig < BigInt(0)) return null;
+
+      const amountLamports = BigInt(Math.round(amount * LAMPORTS_PER_SOL));
+      if (amountLamports <= BigInt(0)) return null;
+
+      return { freelancer, jobIdBig, amountLamports, milestones };
     } catch {
       return null;
     }
-  }, [freelancerAddress, jobId, amountSol]);
+  }, [amountSol, freelancerAddress, jobId, totalMilestones]);
+
+  const projectedEscrowKey = useMemo(() => {
+    if (!wallet.publicKey || !parsed) return null;
+
+    const [key] = escrowPda({
+      client: wallet.publicKey,
+      freelancer: parsed.freelancer,
+      jobId: parsed.jobIdBig,
+    });
+
+    return key.toBase58();
+  }, [parsed, wallet.publicKey]);
 
   const setErr = useCallback((e: unknown) => {
-    setError(e instanceof Error ? e.message : String(e));
+    setError(readableError(e));
   }, []);
+
+  const refreshWalletBalance = useCallback(async () => {
+    if (!wallet.publicKey) {
+      setWalletBalanceLamports(null);
+      return;
+    }
+
+    const balance = await connection.getBalance(wallet.publicKey, "confirmed");
+    setWalletBalanceLamports(balance);
+  }, [connection, wallet.publicKey]);
+
+  const assertProgramDeployed = useCallback(async () => {
+    const programAccount = await connection.getAccountInfo(TRUSTCHAIN_PROGRAM_ID, "confirmed");
+    if (!programAccount?.executable) {
+      throw new Error(`TrustChain program is not deployed on Devnet at ${TRUSTCHAIN_PROGRAM_ID.toBase58()}. Deploy the Anchor program first, then update the frontend program id and IDL.`);
+    }
+  }, [connection]);
 
   const refresh = useCallback(async () => {
     setError(null);
-    setLastTx(null);
 
     if (!wallet.publicKey || !parsed) return;
 
-    const program = getTrustchainProgram(connection, wallet) as any;
+    const program = getTrustchainProgram(connection, wallet) as unknown as TrustchainProgramClient;
     const [escrowKey] = escrowPda({
       client: wallet.publicKey,
       freelancer: parsed.freelancer,
@@ -85,25 +311,7 @@ export function Dashboard() {
     const [freelancerRepKey] = reputationPda(parsed.freelancer);
 
     const escrowAccount = await program.account.escrow.fetchNullable(escrowKey);
-    if (!escrowAccount) {
-      setEscrow(null);
-    } else {
-      const status =
-        "funded" in escrowAccount.status
-          ? "Funded"
-          : "released" in escrowAccount.status
-            ? "Released"
-            : "Unknown";
-
-      setEscrow({
-        escrowKey: escrowKey.toBase58(),
-        client: escrowAccount.client.toBase58(),
-        freelancer: escrowAccount.freelancer.toBase58(),
-        jobId: escrowAccount.jobId.toString(),
-        amountLamports: escrowAccount.amountLamports.toString(),
-        status,
-      });
-    }
+    setEscrow(escrowAccount ? (mapEscrow(escrowKey, escrowAccount) as EscrowView) : null);
 
     const c = await program.account.reputation.fetchNullable(clientRepKey);
     setClientRep(
@@ -137,91 +345,21 @@ export function Dashboard() {
       const sig = await connection.requestAirdrop(wallet.publicKey, 1 * LAMPORTS_PER_SOL);
       await connection.confirmTransaction(sig, "confirmed");
       setLastTx(sig);
+      await refreshWalletBalance();
+    } catch (e) {
+      setError(readableError(e));
     } finally {
       setIsBusy(false);
     }
-  }, [connection, wallet.publicKey]);
-
-  const createEscrow = useCallback(async () => {
-    setError(null);
-    setLastTx(null);
-
-    if (!wallet.publicKey || !parsed) return;
-
-    setIsBusy(true);
-    const program = getTrustchainProgram(connection, wallet) as any;
-    const [escrowKey] = escrowPda({
-      client: wallet.publicKey,
-      freelancer: parsed.freelancer,
-      jobId: parsed.jobIdBig,
-    });
-
-    try {
-      const sig = await program.methods
-        .initializeEscrow(
-          new BN(parsed.jobIdBig.toString()),
-          new BN(parsed.amountLamports.toString()),
-        )
-        .accounts({
-          client: wallet.publicKey,
-          freelancer: parsed.freelancer,
-          escrow: escrowKey,
-        })
-        .rpc();
-
-      setLastTx(sig);
-      await refresh();
-    } finally {
-      setIsBusy(false);
-    }
-  }, [connection, parsed, refresh, wallet]);
-
-  const approveAndRelease = useCallback(async () => {
-    setError(null);
-    setLastTx(null);
-
-    if (!wallet.publicKey || !parsed) return;
-
-    setIsBusy(true);
-    const program = getTrustchainProgram(connection, wallet) as any;
-    const [escrowKey] = escrowPda({
-      client: wallet.publicKey,
-      freelancer: parsed.freelancer,
-      jobId: parsed.jobIdBig,
-    });
-    const [clientRepKey] = reputationPda(wallet.publicKey);
-    const [freelancerRepKey] = reputationPda(parsed.freelancer);
-
-    try {
-      const sig = await program.methods
-        .approveAndRelease(new BN(parsed.jobIdBig.toString()))
-        .accounts({
-          client: wallet.publicKey,
-          freelancer: parsed.freelancer,
-          escrow: escrowKey,
-          clientReputation: clientRepKey,
-          freelancerReputation: freelancerRepKey,
-        })
-        .rpc();
-
-      setLastTx(sig);
-      await refresh();
-    } finally {
-      setIsBusy(false);
-    }
-  }, [connection, parsed, refresh, wallet]);
+  }, [connection, refreshWalletBalance, wallet.publicKey]);
 
   const loadMyEscrows = useCallback(async () => {
     if (!wallet.publicKey) return;
     setError(null);
-    setLastTx(null);
     setMyEscrowsLoading(true);
     try {
-      const program = getTrustchainProgram(connection, wallet) as any;
+      const program = getTrustchainProgram(connection, wallet) as unknown as TrustchainProgramClient;
 
-      // Account layout (after 8-byte discriminator):
-      // client: 32 bytes @ offset 8
-      // freelancer: 32 bytes @ offset 40
       const clientFilter = {
         memcmp: { offset: 8, bytes: wallet.publicKey.toBase58() },
       };
@@ -234,26 +372,10 @@ export function Dashboard() {
         program.account.escrow.all([freelancerFilter]),
       ]);
 
-      const mapItem = (role: "Client" | "Freelancer") => (r: any): EscrowListItem => {
-        const status =
-          "funded" in r.account.status
-            ? "Funded"
-            : "released" in r.account.status
-              ? "Released"
-              : "Unknown";
-
-        return {
-          role,
-          escrowKey: r.publicKey.toBase58(),
-          client: r.account.client.toBase58(),
-          freelancer: r.account.freelancer.toBase58(),
-          jobId: r.account.jobId.toString(),
-          amountLamports: r.account.amountLamports.toString(),
-          status,
-        };
-      };
-
-      const merged = [...asClient.map(mapItem("Client")), ...asFreelancer.map(mapItem("Freelancer"))];
+      const merged = [
+        ...asClient.map((r) => mapEscrow(r.publicKey, r.account, "Client") as EscrowListItem),
+        ...asFreelancer.map((r) => mapEscrow(r.publicKey, r.account, "Freelancer") as EscrowListItem),
+      ];
       const unique = new Map<string, EscrowListItem>();
       for (const e of merged) unique.set(e.escrowKey, e);
 
@@ -270,136 +392,207 @@ export function Dashboard() {
     }
   }, [connection, wallet]);
 
-  useEffect(() => {
-    if (!wallet.publicKey) {
-      setMyEscrows([]);
-      setEscrow(null);
-      setClientRep(null);
-      setFreelancerRep(null);
-      return;
+  const createEscrow = useCallback(async () => {
+    setError(null);
+    setLastTx(null);
+
+    if (!wallet.publicKey || !parsed) return;
+
+    setIsBusy(true);
+    const program = getTrustchainProgram(connection, wallet) as unknown as TrustchainProgramClient;
+    const [escrowKey] = escrowPda({
+      client: wallet.publicKey,
+      freelancer: parsed.freelancer,
+      jobId: parsed.jobIdBig,
+    });
+
+    try {
+      await assertProgramDeployed();
+      const sig = await program.methods
+        .initializeEscrow(
+          new BN(parsed.jobIdBig.toString()),
+          new BN(parsed.amountLamports.toString()),
+          parsed.milestones,
+        )
+        .accounts({
+          client: wallet.publicKey,
+          freelancer: parsed.freelancer,
+          escrow: escrowKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      setLastTx(sig);
+      await refresh();
+      await loadMyEscrows();
+      await refreshWalletBalance();
+    } finally {
+      setIsBusy(false);
     }
-    // Prime the UI once connected.
-    loadMyEscrows().catch(() => {});
-  }, [loadMyEscrows, wallet.publicKey]);
+  }, [assertProgramDeployed, connection, loadMyEscrows, parsed, refresh, refreshWalletBalance, wallet]);
 
-  const statusTone = (s: EscrowView["status"]) =>
-    s === "Released" ? "success" : s === "Funded" ? "brand" : "neutral";
+  const approveMilestone = useCallback(async () => {
+    setError(null);
+    setLastTx(null);
 
-  const errorBox = error ? (
-    <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-red-900">
-      <div className="text-xs font-semibold uppercase tracking-wide">Error</div>
-      <div className="mt-1 break-words font-mono text-xs">{error}</div>
-    </div>
-  ) : null;
+    if (!wallet.publicKey || !parsed) return;
 
-  const txBox = lastTx ? (
-    <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-emerald-900">
-      <div className="flex items-center justify-between gap-3">
-        <div className="text-xs font-semibold uppercase tracking-wide">Last transaction</div>
-        <a
-          className="text-xs font-medium underline underline-offset-4"
-          href={solscanTxUrl(lastTx)}
-          target="_blank"
-          rel="noreferrer"
-        >
-          View on Solscan
-        </a>
-      </div>
-      <div className="mt-2 break-all font-mono text-xs">{lastTx}</div>
-    </div>
-  ) : null;
+    setIsBusy(true);
+    const program = getTrustchainProgram(connection, wallet) as unknown as TrustchainProgramClient;
+    const [escrowKey] = escrowPda({
+      client: wallet.publicKey,
+      freelancer: parsed.freelancer,
+      jobId: parsed.jobIdBig,
+    });
+    const [clientRepKey] = reputationPda(wallet.publicKey);
+    const [freelancerRepKey] = reputationPda(parsed.freelancer);
+
+    try {
+      await assertProgramDeployed();
+      const sig = await program.methods
+        .approveMilestone(new BN(parsed.jobIdBig.toString()))
+        .accounts({
+          client: wallet.publicKey,
+          freelancer: parsed.freelancer,
+          escrow: escrowKey,
+          clientReputation: clientRepKey,
+          freelancerReputation: freelancerRepKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      setLastTx(sig);
+      await refresh();
+      await loadMyEscrows();
+      await refreshWalletBalance();
+    } finally {
+      setIsBusy(false);
+    }
+  }, [assertProgramDeployed, connection, loadMyEscrows, parsed, refresh, refreshWalletBalance, wallet]);
+
+  useEffect(() => {
+    if (!wallet.publicKey) return;
+    const timer = window.setTimeout(() => {
+      loadMyEscrows().catch(() => {});
+      refreshWalletBalance().catch(() => {});
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [loadMyEscrows, refreshWalletBalance, wallet.publicKey]);
+
+  const useWalletAsFreelancer = () => {
+    if (!wallet.publicKey) return;
+    setFreelancerAddress(wallet.publicKey.toBase58());
+    setJobId(String(Date.now()).slice(-6));
+    setAmountSol("0.25");
+    setTotalMilestones("3");
+  };
+
+  const hydrateFromEscrow = (item: EscrowListItem) => {
+    setFreelancerAddress(item.freelancer);
+    setJobId(item.jobId);
+    setAmountSol((Number(item.amountLamports) / LAMPORTS_PER_SOL).toString());
+    setTotalMilestones(String(item.totalMilestones));
+    setTab("workbench");
+  };
+
+  const fundedEscrows = myEscrows.filter((e) => e.status !== "Released").length;
+  const releasedEscrows = myEscrows.filter((e) => e.status === "Released").length;
+  const totalLocked = myEscrows.reduce((sum, e) => {
+    if (e.status === "Released") return sum;
+    return sum + Number(e.amountLamports) - Number(e.amountReleasedLamports);
+  }, 0);
+
+  const nextMilestoneSol =
+    escrow && escrow.status !== "Released"
+      ? sol(
+          escrow.releasedMilestones + 1 === escrow.totalMilestones
+            ? Number(escrow.amountLamports) - Number(escrow.amountReleasedLamports)
+            : Math.floor(Number(escrow.amountLamports) / escrow.totalMilestones),
+        )
+      : "0";
+
+  const formIsReady = canSend && parsed && !isBusy;
+  const walletBalance = walletBalanceLamports === null ? "--" : `${sol(walletBalanceLamports)} SOL`;
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-indigo-50 via-white to-white text-zinc-900">
-      <div className="mx-auto w-full max-w-6xl px-6 py-10">
-        <header className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+    <main className="min-h-screen bg-[#f7faf8] text-zinc-950">
+      <section className="border-b border-zinc-200 bg-zinc-950 text-white">
+        <div className="mx-auto grid w-full max-w-7xl gap-8 px-5 py-8 lg:grid-cols-[1.2fr_0.8fr] lg:px-8">
           <div>
-            <div className="flex items-center gap-2">
-              <Badge tone="brand">Devnet</Badge>
-              <Badge>Escrow</Badge>
-              <Badge>Reputation</Badge>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="brand">Solana Devnet</Badge>
+              <Badge>Milestone escrow</Badge>
+              <Badge>On-chain reputation</Badge>
             </div>
-            <h1 className="mt-3 text-3xl font-semibold tracking-tight">
-              TrustChain Lite
+            <h1 className="mt-5 max-w-3xl text-4xl font-semibold tracking-tight text-white md:text-6xl">
+              Trustless freelance payments, released one milestone at a time.
             </h1>
-            <p className="mt-2 max-w-2xl text-sm text-zinc-600">
-              Lock SOL into an on-chain escrow, approve delivery, auto-release payment, and update
-              wallet-based reputation—no backend required.
+            <p className="mt-4 max-w-2xl text-sm leading-6 text-zinc-300 md:text-base">
+              Create a job, lock SOL in a program-owned escrow PDA, approve completed work, and let the contract release funds while reputation updates on-chain.
             </p>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-3 md:justify-end">
-            {wallet.publicKey ? (
-              <div className="rounded-2xl border border-zinc-200 bg-white/80 px-4 py-3 text-sm shadow-sm backdrop-blur">
-                <div className="text-xs font-semibold text-zinc-600">Wallet</div>
-                <div className="mt-1 flex items-center gap-2">
-                  <a
-                    className="font-mono text-xs underline underline-offset-4"
-                    href={solscanAccountUrl(wallet.publicKey.toBase58())}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {shortKey(wallet.publicKey.toBase58(), 6, 6)}
-                  </a>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() =>
-                      copyToClipboard(wallet.publicKey!.toBase58()).catch(() => {})
-                    }
-                  >
-                    Copy
-                  </Button>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="flex items-center gap-2">
-              <Button
-                variant="secondary"
-                disabled={!wallet.publicKey || isBusy}
-                onClick={() => airdropOneSol().catch(setErr)}
-              >
+            <div className="mt-6 flex flex-wrap items-center gap-3">
+              <ClientWalletButton />
+              <Button variant="secondary" disabled={!wallet.publicKey || isBusy} onClick={() => airdropOneSol().catch(setErr)}>
                 Airdrop 1 SOL
               </Button>
-              <WalletMultiButton />
+              {wallet.publicKey ? (
+                <a
+                  className="font-mono text-xs text-cyan-200 underline underline-offset-4"
+                  href={solscanAccountUrl(wallet.publicKey.toBase58())}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {shortKey(wallet.publicKey.toBase58(), 7, 7)}
+                </a>
+              ) : null}
             </div>
           </div>
-        </header>
 
-        <div className="mt-8 flex flex-wrap items-center gap-2">
-          <Button
-            variant={tab === "create" ? "primary" : "secondary"}
-            onClick={() => setTab("create")}
-          >
-            Create / Manage
-          </Button>
-          <Button
-            variant={tab === "my-escrows" ? "primary" : "secondary"}
-            onClick={() => setTab("my-escrows")}
-            disabled={!wallet.publicKey}
-          >
-            My escrows
-          </Button>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
+            <Stat label="Wallet balance" value={walletBalance} helper="Connected Phantom on Devnet" />
+            <Stat label="Active escrows" value={String(fundedEscrows)} helper="Funded or in progress" />
+            <Stat label="Locked balance" value={`${sol(totalLocked)} SOL`} helper="Across your visible escrows" />
+            <Stat label="Completed jobs" value={String(releasedEscrows)} helper="Released on-chain" />
+          </div>
+        </div>
+      </section>
+
+      <section className="mx-auto w-full max-w-7xl px-5 py-6 lg:px-8">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex rounded-lg border border-zinc-200 bg-white p-1 shadow-sm">
+            <Button
+              variant={tab === "workbench" ? "primary" : "ghost"}
+              onClick={() => setTab("workbench")}
+              className="shadow-none"
+            >
+              Workbench
+            </Button>
+            <Button
+              variant={tab === "my-escrows" ? "primary" : "ghost"}
+              disabled={!wallet.publicKey}
+              onClick={() => setTab("my-escrows")}
+              className="shadow-none"
+            >
+              My escrows
+            </Button>
+          </div>
+          <div className="text-xs text-zinc-500">
+            {wallet.connected ? "Connected to Devnet through Phantom." : "Connect Phantom to create and release escrows."}
+          </div>
         </div>
 
-        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
-          <div className="lg:col-span-2 space-y-6">
-            {tab === "create" ? (
+        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[1fr_380px]">
+          <div className="space-y-6">
+            {tab === "workbench" ? (
               <Card>
                 <CardHeader
-                  title="Create escrow"
-                  subtitle="Client locks funds into a program-owned PDA."
-                  right={
-                    canSend ? (
-                      <Badge tone="success">Wallet connected</Badge>
-                    ) : (
-                      <Badge tone="warning">Connect wallet</Badge>
-                    )
-                  }
+                  title="Create and manage a contract"
+                  subtitle="The client signs every funding and milestone approval transaction."
+                  right={canSend ? <Badge tone="success">Wallet ready</Badge> : <Badge tone="warning">Wallet required</Badge>}
                 />
 
-                <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2">
                   <label className="md:col-span-2">
                     <div className="text-xs font-semibold text-zinc-600">Freelancer wallet</div>
                     <div className="mt-2">
@@ -419,47 +612,65 @@ export function Dashboard() {
                   </label>
 
                   <label>
-                    <div className="text-xs font-semibold text-zinc-600">Amount (SOL)</div>
+                    <div className="text-xs font-semibold text-zinc-600">Total amount (SOL)</div>
                     <div className="mt-2">
                       <Input value={amountSol} onChange={setAmountSol} inputMode="decimal" />
                     </div>
                   </label>
+
+                  <label>
+                    <div className="text-xs font-semibold text-zinc-600">Milestones</div>
+                    <div className="mt-2">
+                      <Input value={totalMilestones} onChange={setTotalMilestones} inputMode="numeric" />
+                    </div>
+                  </label>
+
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-4">
+                    <div className="text-xs font-semibold text-zinc-500">Next milestone release</div>
+                    <div className="mt-2 text-2xl font-semibold">{escrow ? `${nextMilestoneSol} SOL` : "Pending"}</div>
+                    <p className="mt-1 text-xs text-zinc-500">Final milestone includes any lamport remainder.</p>
+                  </div>
                 </div>
 
                 <div className="mt-5 flex flex-wrap gap-2">
-                  <Button
-                    disabled={!canSend || !parsed || isBusy}
-                    onClick={() => createEscrow().catch(setErr)}
-                  >
+                  <Button disabled={!formIsReady} onClick={() => createEscrow().catch(setErr)}>
                     Lock funds
                   </Button>
                   <Button
                     variant="secondary"
-                    disabled={!canSend || !parsed || isBusy}
-                    onClick={() => approveAndRelease().catch(setErr)}
+                    disabled={!formIsReady || !escrow || escrow.status === "Released"}
+                    onClick={() => approveMilestone().catch(setErr)}
                   >
-                    Approve & release
+                    Approve next milestone
                   </Button>
-                  <Button
-                    variant="secondary"
-                    disabled={!canSend || !parsed || isBusy}
-                    onClick={() => refresh().catch(setErr)}
-                  >
+                  <Button variant="secondary" disabled={!formIsReady} onClick={() => refresh().catch(setErr)}>
                     Refresh
+                  </Button>
+                  <Button variant="ghost" disabled={!wallet.publicKey || isBusy} onClick={useWalletAsFreelancer}>
+                    Use demo values
                   </Button>
                 </div>
 
-                {wallet.connected ? null : (
-                  <p className="mt-4 text-xs text-zinc-500">
-                    Connect Phantom first. For Devnet you can use the built-in airdrop button.
-                  </p>
-                )}
+                <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-3">
+                  <div className="rounded-lg bg-zinc-50 p-3">
+                    <div className="text-xs font-semibold text-zinc-500">Validation</div>
+                    <div className="mt-1 text-sm font-medium">{parsed ? "Ready to sign" : "Check form inputs"}</div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-50 p-3">
+                    <div className="text-xs font-semibold text-zinc-500">Program account</div>
+                    <div className="mt-1 truncate font-mono text-xs">{projectedEscrowKey ? shortKey(projectedEscrowKey, 8, 8) : "Derived after valid inputs"}</div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-50 p-3">
+                    <div className="text-xs font-semibold text-zinc-500">Network</div>
+                    <div className="mt-1 text-sm font-medium">Devnet confirmed</div>
+                  </div>
+                </div>
               </Card>
             ) : (
               <Card>
                 <CardHeader
                   title="My escrows"
-                  subtitle="Escrows where you are the client or the freelancer."
+                  subtitle="Contracts where the connected wallet is client or freelancer."
                   right={
                     <Button
                       variant="secondary"
@@ -473,75 +684,42 @@ export function Dashboard() {
 
                 <div className="mt-5">
                   {myEscrowsLoading ? (
-                    <p className="text-sm text-zinc-600">Loading escrows…</p>
+                    <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-6 text-sm text-zinc-600">Loading escrows...</div>
                   ) : myEscrows.length === 0 ? (
-                    <div className="rounded-2xl border border-dashed border-zinc-200 bg-zinc-50 p-6">
-                      <div className="text-sm font-semibold">No escrows yet</div>
-                      <p className="mt-1 text-sm text-zinc-600">
-                        Create one in the “Create / Manage” tab to see it here.
-                      </p>
+                    <div className="rounded-lg border border-dashed border-zinc-300 bg-zinc-50 p-6">
+                      <div className="text-sm font-semibold">No escrows found</div>
+                      <p className="mt-1 text-sm text-zinc-600">Create a contract from the workbench to populate your on-chain history.</p>
                     </div>
                   ) : (
-                    <div className="space-y-3">
-                      {myEscrows.map((e) => (
-                        <div
-                          key={e.escrowKey}
-                          className="rounded-2xl border border-zinc-200 bg-white p-4"
-                        >
-                          <div className="flex flex-wrap items-center justify-between gap-3">
-                            <div className="flex items-center gap-2">
-                              <Badge tone={statusTone(e.status) as any}>{e.status}</Badge>
-                              <Badge>{e.role}</Badge>
-                              <span className="text-sm font-semibold">Job #{e.jobId}</span>
+                    <div className="grid grid-cols-1 gap-3">
+                      {myEscrows.map((item) => (
+                        <article key={item.escrowKey} className="rounded-lg border border-zinc-200 bg-white p-4">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge tone={statusTone(item.status)}>{item.status}</Badge>
+                                <Badge>{item.role}</Badge>
+                                <span className="text-sm font-semibold">Job #{item.jobId}</span>
+                              </div>
+                              <div className="mt-2 text-xs text-zinc-500">
+                                {sol(item.amountReleasedLamports)} of {sol(item.amountLamports)} SOL released
+                              </div>
                             </div>
-                            <div className="text-sm font-semibold">
-                              {(Number(e.amountLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL
-                            </div>
+                            <Button variant="secondary" size="sm" onClick={() => hydrateFromEscrow(item)}>
+                              Manage
+                            </Button>
                           </div>
 
-                          <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2 text-xs text-zinc-600">
-                            <div className="flex items-center justify-between gap-3 rounded-xl bg-zinc-50 px-3 py-2">
-                              <span>Escrow</span>
-                              <div className="flex items-center gap-2">
-                                <a
-                                  className="font-mono underline underline-offset-4"
-                                  href={solscanAccountUrl(e.escrowKey)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  {shortKey(e.escrowKey, 6, 6)}
-                                </a>
-                                <Button
-                                  size="sm"
-                                  variant="ghost"
-                                  onClick={() => copyToClipboard(e.escrowKey).catch(() => {})}
-                                >
-                                  Copy
-                                </Button>
-                              </div>
-                            </div>
-                            <div className="flex items-center justify-between gap-3 rounded-xl bg-zinc-50 px-3 py-2">
-                              <span>Freelancer</span>
-                              <div className="flex items-center gap-2">
-                                <a
-                                  className="font-mono underline underline-offset-4"
-                                  href={solscanAccountUrl(e.freelancer)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  {shortKey(e.freelancer, 6, 6)}
-                                </a>
-                                <Button
-                                  size="sm"
-                                  variant="ghost"
-                                  onClick={() => copyToClipboard(e.freelancer).catch(() => {})}
-                                >
-                                  Copy
-                                </Button>
-                              </div>
-                            </div>
+                          <div className="mt-4">
+                            <ProgressBar released={item.releasedMilestones} total={item.totalMilestones} />
                           </div>
-                        </div>
+
+                          <div className="mt-4 grid grid-cols-1 gap-2 md:grid-cols-3">
+                            <KeyLink label="Escrow" value={item.escrowKey} />
+                            <KeyLink label="Client" value={item.client} />
+                            <KeyLink label="Freelancer" value={item.freelancer} />
+                          </div>
+                        </article>
                       ))}
                     </div>
                   )}
@@ -549,110 +727,112 @@ export function Dashboard() {
               </Card>
             )}
 
-            {txBox}
-            {errorBox}
+            {lastTx ? (
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-emerald-950">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide">Transaction confirmed</div>
+                  <a className="text-xs font-medium underline underline-offset-4" href={solscanTxUrl(lastTx)} target="_blank" rel="noreferrer">
+                    View on Solscan
+                  </a>
+                </div>
+                <div className="mt-2 break-all font-mono text-xs">{lastTx}</div>
+              </div>
+            ) : null}
+
+            {error ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-950">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide">Error</div>
+                  {error.includes("rate limited") ? (
+                    <a
+                      className="text-xs font-semibold underline underline-offset-4"
+                      href="https://faucet.solana.com/"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open Solana faucet
+                    </a>
+                  ) : null}
+                </div>
+                <div className="mt-1 break-words font-mono text-xs">{error}</div>
+              </div>
+            ) : null}
           </div>
 
-          <div className="space-y-6">
+          <aside className="space-y-6">
             <Card>
               <CardHeader
                 title="Current contract"
-                subtitle="Derived from the inputs on the left."
-                right={
-                  escrow ? <Badge tone={statusTone(escrow.status) as any}>{escrow.status}</Badge> : null
-                }
+                subtitle="Derived from the form values."
+                right={escrow ? <Badge tone={statusTone(escrow.status)}>{escrow.status}</Badge> : null}
               />
-
-              <div className="mt-4 space-y-3 text-sm">
+              <div className="mt-4 space-y-4">
                 {!escrow ? (
-                  <div className="rounded-2xl border border-dashed border-zinc-200 bg-zinc-50 p-6">
-                    <div className="text-sm font-semibold">No escrow loaded</div>
-                    <p className="mt-1 text-sm text-zinc-600">
-                      Enter a freelancer + job id, then click Refresh.
-                    </p>
+                  <div className="rounded-lg border border-dashed border-zinc-300 bg-zinc-50 p-5">
+                    <div className="text-sm font-semibold">No contract loaded</div>
+                    <p className="mt-1 text-sm text-zinc-600">Enter a freelancer and job ID, then refresh or create a contract.</p>
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between rounded-xl bg-zinc-50 px-3 py-2">
-                      <span className="text-xs font-semibold text-zinc-600">Amount</span>
-                      <span className="font-semibold">
-                        {(Number(escrow.amountLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL
-                      </span>
-                    </div>
-
-                    <div className="flex items-center justify-between rounded-xl bg-zinc-50 px-3 py-2">
-                      <span className="text-xs font-semibold text-zinc-600">Escrow PDA</span>
-                      <div className="flex items-center gap-2">
-                        <a
-                          className="font-mono text-xs underline underline-offset-4"
-                          href={solscanAccountUrl(escrow.escrowKey)}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          {shortKey(escrow.escrowKey, 6, 6)}
-                        </a>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => copyToClipboard(escrow.escrowKey).catch(() => {})}
-                        >
-                          Copy
-                        </Button>
+                  <>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="rounded-lg bg-zinc-50 p-3">
+                        <div className="text-xs font-semibold text-zinc-500">Escrowed</div>
+                        <div className="mt-1 text-lg font-semibold">{sol(escrow.amountLamports)} SOL</div>
+                      </div>
+                      <div className="rounded-lg bg-zinc-50 p-3">
+                        <div className="text-xs font-semibold text-zinc-500">Released</div>
+                        <div className="mt-1 text-lg font-semibold">{sol(escrow.amountReleasedLamports)} SOL</div>
                       </div>
                     </div>
-                  </div>
+                    <ProgressBar released={escrow.releasedMilestones} total={escrow.totalMilestones} />
+                    <KeyLink label="Escrow PDA" value={escrow.escrowKey} />
+                    <KeyLink label="Freelancer" value={escrow.freelancer} />
+                  </>
                 )}
               </div>
             </Card>
 
             <Card>
-              <CardHeader title="Reputation" subtitle="On-chain score updates on release." />
-              <div className="mt-4 space-y-3 text-sm">
-                <div className="rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
+              <CardHeader title="Reputation" subtitle="Score updates after final milestone." />
+              <div className="mt-4 space-y-3">
+                <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-4">
                   <div className="flex items-center justify-between">
                     <div className="text-xs font-semibold text-zinc-600">Client</div>
                     {clientRep ? <Badge tone="success">Active</Badge> : <Badge>Not created</Badge>}
                   </div>
-                  <div className="mt-2 text-sm">
-                    Score{" "}
-                    <span className="font-semibold">{clientRep ? clientRep.score : "—"}</span> • Jobs{" "}
-                    <span className="font-semibold">
-                      {clientRep ? clientRep.completedJobs : "—"}
-                    </span>
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                    <div>
+                      <div className="text-xs text-zinc-500">Score</div>
+                      <div className="font-semibold">{clientRep ? clientRep.score : "-"}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500">Jobs</div>
+                      <div className="font-semibold">{clientRep ? clientRep.completedJobs : "-"}</div>
+                    </div>
                   </div>
                 </div>
 
-                <div className="rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
+                <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-4">
                   <div className="flex items-center justify-between">
                     <div className="text-xs font-semibold text-zinc-600">Freelancer</div>
-                    {freelancerRep ? (
-                      <Badge tone="success">Active</Badge>
-                    ) : (
-                      <Badge>Not created</Badge>
-                    )}
+                    {freelancerRep ? <Badge tone="success">Active</Badge> : <Badge>Not created</Badge>}
                   </div>
-                  <div className="mt-2 text-sm">
-                    Score{" "}
-                    <span className="font-semibold">
-                      {freelancerRep ? freelancerRep.score : "—"}
-                    </span>{" "}
-                    • Jobs{" "}
-                    <span className="font-semibold">
-                      {freelancerRep ? freelancerRep.completedJobs : "—"}
-                    </span>
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                    <div>
+                      <div className="text-xs text-zinc-500">Score</div>
+                      <div className="font-semibold">{freelancerRep ? freelancerRep.score : "-"}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500">Jobs</div>
+                      <div className="font-semibold">{freelancerRep ? freelancerRep.completedJobs : "-"}</div>
+                    </div>
                   </div>
                 </div>
               </div>
             </Card>
-          </div>
+          </aside>
         </div>
-
-        <footer className="mt-10 text-xs text-zinc-500">
-          Tip: if an escrow doesn’t show up immediately, click Refresh or wait a confirmation on
-          Devnet.
-        </footer>
-      </div>
-    </div>
+      </section>
+    </main>
   );
 }
-

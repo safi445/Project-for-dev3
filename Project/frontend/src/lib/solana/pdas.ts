@@ -6,8 +6,8 @@ export function escrowPda(params: {
   freelancer: PublicKey;
   jobId: bigint;
 }): [PublicKey, number] {
-  const jobIdLe8 = Buffer.alloc(8);
-  jobIdLe8.writeBigUInt64LE(params.jobId, 0);
+  const jobIdLe8 = new Uint8Array(8);
+  new DataView(jobIdLe8.buffer).setBigUint64(0, params.jobId, true);
 
   return PublicKey.findProgramAddressSync(
     [
@@ -26,4 +26,3 @@ export function reputationPda(user: PublicKey): [PublicKey, number] {
     TRUSTCHAIN_PROGRAM_ID,
   );
 }
-

@@ -12,7 +12,7 @@ export function Card({
   return (
     <section
       className={cx(
-        "rounded-2xl border border-zinc-200/80 bg-white/80 p-5 shadow-sm backdrop-blur",
+        "rounded-lg border border-zinc-200/80 bg-white p-5 shadow-sm",
         className,
       )}
     >
@@ -40,4 +40,3 @@ export function CardHeader({
     </div>
   );
 }
-

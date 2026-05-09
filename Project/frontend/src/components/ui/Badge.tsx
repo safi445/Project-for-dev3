@@ -17,9 +17,8 @@ export function Badge({
     success: "border-emerald-200 bg-emerald-50 text-emerald-800",
     warning: "border-amber-200 bg-amber-50 text-amber-900",
     danger: "border-red-200 bg-red-50 text-red-800",
-    brand: "border-indigo-200 bg-indigo-50 text-indigo-900",
+    brand: "border-cyan-200 bg-cyan-50 text-cyan-900",
   };
 
   return <span className={cx(base, tones[tone])}>{children}</span>;
 }
-

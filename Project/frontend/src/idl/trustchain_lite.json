@@ -8,6 +8,7 @@
   "instructions": [
     {
       "name": "initializeEscrow",
+      "discriminator": [243, 160, 77, 153, 11, 92, 48, 209],
       "accounts": [
         { "name": "client", "writable": true, "signer": true },
         { "name": "freelancer", "writable": false, "signer": false },
@@ -16,11 +17,13 @@
       ],
       "args": [
         { "name": "jobId", "type": "u64" },
-        { "name": "amountLamports", "type": "u64" }
+        { "name": "amountLamports", "type": "u64" },
+        { "name": "totalMilestones", "type": "u8" }
       ]
     },
     {
-      "name": "approveAndRelease",
+      "name": "approveMilestone",
+      "discriminator": [145, 85, 92, 60, 50, 130, 219, 106],
       "accounts": [
         { "name": "client", "writable": true, "signer": true },
         { "name": "freelancer", "writable": true, "signer": false },
@@ -34,10 +37,12 @@
   ],
   "accounts": [
     {
-      "name": "escrow"
+      "name": "escrow",
+      "discriminator": [31, 213, 123, 187, 186, 22, 218, 155]
     },
     {
-      "name": "reputation"
+      "name": "reputation",
+      "discriminator": [55, 148, 90, 71, 68, 183, 193, 28]
     }
   ],
   "types": [
@@ -50,7 +55,10 @@
           { "name": "freelancer", "type": "pubkey" },
           { "name": "jobId", "type": "u64" },
           { "name": "amountLamports", "type": "u64" },
-          { "name": "status", "type": { "defined": "escrowStatus" } },
+          { "name": "amountReleasedLamports", "type": "u64" },
+          { "name": "totalMilestones", "type": "u8" },
+          { "name": "releasedMilestones", "type": "u8" },
+          { "name": "status", "type": { "defined": { "name": "escrowStatus" } } },
           { "name": "bump", "type": "u8" }
         ]
       }
@@ -70,9 +78,8 @@
       "name": "escrowStatus",
       "type": {
         "kind": "enum",
-        "variants": [{ "name": "Funded" }, { "name": "Released" }]
+        "variants": [{ "name": "Funded" }, { "name": "InProgress" }, { "name": "Released" }]
       }
     }
   ]
 }
-

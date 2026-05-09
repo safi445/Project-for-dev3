@@ -13,14 +13,23 @@ pub mod trustchain_lite {
         ctx: Context<InitializeEscrow>,
         job_id: u64,
         amount_lamports: u64,
+        total_milestones: u8,
     ) -> Result<()> {
         require!(amount_lamports > 0, TrustChainError::InvalidAmount);
+        require!(total_milestones > 0, TrustChainError::InvalidMilestones);
+        require!(
+            amount_lamports >= total_milestones as u64,
+            TrustChainError::InvalidMilestones
+        );
 
         let escrow = &mut ctx.accounts.escrow;
         escrow.client = ctx.accounts.client.key();
         escrow.freelancer = ctx.accounts.freelancer.key();
         escrow.job_id = job_id;
         escrow.amount_lamports = amount_lamports;
+        escrow.amount_released_lamports = 0;
+        escrow.total_milestones = total_milestones;
+        escrow.released_milestones = 0;
         escrow.status = EscrowStatus::Funded;
         escrow.bump = ctx.bumps.escrow;
 
@@ -45,16 +54,17 @@ pub mod trustchain_lite {
             freelancer: escrow.freelancer,
             job_id,
             amount_lamports,
+            total_milestones,
         });
 
         Ok(())
     }
 
-    pub fn approve_and_release(ctx: Context<ApproveAndRelease>, _job_id: u64) -> Result<()> {
+    pub fn approve_milestone(ctx: Context<ApproveMilestone>, _job_id: u64) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
 
         require!(
-            escrow.status == EscrowStatus::Funded,
+            escrow.status == EscrowStatus::Funded || escrow.status == EscrowStatus::InProgress,
             TrustChainError::InvalidStatus
         );
         require_keys_eq!(escrow.client, ctx.accounts.client.key(), TrustChainError::Unauthorized);
@@ -63,8 +73,27 @@ pub mod trustchain_lite {
             ctx.accounts.freelancer.key(),
             TrustChainError::InvalidFreelancer
         );
+        require!(
+            escrow.released_milestones < escrow.total_milestones,
+            TrustChainError::InvalidStatus
+        );
 
-        let amount = escrow.amount_lamports;
+        let next_milestone = escrow.released_milestones.saturating_add(1);
+        let is_final_milestone = next_milestone == escrow.total_milestones;
+        let base_milestone_amount = escrow
+            .amount_lamports
+            .checked_div(escrow.total_milestones as u64)
+            .ok_or(TrustChainError::InvalidMilestones)?;
+        let amount = if is_final_milestone {
+            escrow
+                .amount_lamports
+                .checked_sub(escrow.amount_released_lamports)
+                .ok_or(TrustChainError::InvalidAmount)?
+        } else {
+            base_milestone_amount
+        };
+
+        require!(amount > 0, TrustChainError::InvalidMilestoneAmount);
         require!(
             **escrow.to_account_info().lamports.borrow() >= amount,
             TrustChainError::InsufficientEscrowBalance
@@ -78,28 +107,44 @@ pub mod trustchain_lite {
             .to_account_info()
             .try_borrow_mut_lamports()? += amount;
 
-        escrow.status = EscrowStatus::Released;
+        escrow.released_milestones = next_milestone;
+        escrow.amount_released_lamports = escrow.amount_released_lamports.saturating_add(amount);
+        escrow.status = if is_final_milestone {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::InProgress
+        };
 
-        let client_rep = &mut ctx.accounts.client_reputation;
-        let freelancer_rep = &mut ctx.accounts.freelancer_reputation;
+        let mut client_score = ctx.accounts.client_reputation.score;
+        let mut freelancer_score = ctx.accounts.freelancer_reputation.score;
 
-        client_rep.user = escrow.client;
-        freelancer_rep.user = escrow.freelancer;
+        if is_final_milestone {
+            let client_rep = &mut ctx.accounts.client_reputation;
+            let freelancer_rep = &mut ctx.accounts.freelancer_reputation;
 
-        client_rep.completed_jobs = client_rep.completed_jobs.saturating_add(1);
-        freelancer_rep.completed_jobs = freelancer_rep.completed_jobs.saturating_add(1);
+            client_rep.user = escrow.client;
+            freelancer_rep.user = escrow.freelancer;
 
-        // Simple hackathon scoring rule: +1 point per completed job.
-        client_rep.score = client_rep.score.saturating_add(1);
-        freelancer_rep.score = freelancer_rep.score.saturating_add(1);
+            client_rep.completed_jobs = client_rep.completed_jobs.saturating_add(1);
+            freelancer_rep.completed_jobs = freelancer_rep.completed_jobs.saturating_add(1);
 
-        emit!(EscrowReleased {
+            // Simple hackathon scoring rule: +1 point per completed job.
+            client_rep.score = client_rep.score.saturating_add(1);
+            freelancer_rep.score = freelancer_rep.score.saturating_add(1);
+
+            client_score = client_rep.score;
+            freelancer_score = freelancer_rep.score;
+        }
+
+        emit!(MilestoneApproved {
             escrow: escrow.key(),
             client: escrow.client,
             freelancer: escrow.freelancer,
             amount_lamports: amount,
-            client_score: client_rep.score,
-            freelancer_score: freelancer_rep.score,
+            released_milestones: escrow.released_milestones,
+            total_milestones: escrow.total_milestones,
+            client_score,
+            freelancer_score,
         });
 
         Ok(())
@@ -129,7 +174,7 @@ pub struct InitializeEscrow<'info> {
 
 #[derive(Accounts)]
 #[instruction(job_id: u64)]
-pub struct ApproveAndRelease<'info> {
+pub struct ApproveMilestone<'info> {
     #[account(mut)]
     pub client: Signer<'info>,
 
@@ -173,14 +218,17 @@ pub struct EscrowCreated {
     pub freelancer: Pubkey,
     pub job_id: u64,
     pub amount_lamports: u64,
+    pub total_milestones: u8,
 }
 
 #[event]
-pub struct EscrowReleased {
+pub struct MilestoneApproved {
     pub escrow: Pubkey,
     pub client: Pubkey,
     pub freelancer: Pubkey,
     pub amount_lamports: u64,
+    pub released_milestones: u8,
+    pub total_milestones: u8,
     pub client_score: u64,
     pub freelancer_score: u64,
 }
@@ -189,6 +237,10 @@ pub struct EscrowReleased {
 pub enum TrustChainError {
     #[msg("Invalid amount")]
     InvalidAmount,
+    #[msg("Invalid milestone count")]
+    InvalidMilestones,
+    #[msg("Milestone amount is too small")]
+    InvalidMilestoneAmount,
     #[msg("Invalid escrow status")]
     InvalidStatus,
     #[msg("Unauthorized signer")]
@@ -198,4 +250,3 @@ pub enum TrustChainError {
     #[msg("Escrow account has insufficient balance")]
     InsufficientEscrowBalance,
 }
-
