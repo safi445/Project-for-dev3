@@ -7,7 +7,7 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-trustchain_lite = "Tru5tCha1nL1te11111111111111111111111111111"
+trustchain_lite = "3AJ7pp8SVW91iFYhB5LgctFrsgaeGKVX3qRVsN48922M"
 
 [registry]
 url = "https://api.apr.dev"

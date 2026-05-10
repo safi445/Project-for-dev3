@@ -15,23 +15,22 @@ TrustChain Lite is a lightweight, hackathon-friendly **decentralized freelancer 
 
 ## 1) Build + deploy the Solana program (Devnet)
 
-From `anchor/`:
+**Program ID (submission / explorers):** `3AJ7pp8SVW91iFYhB5LgctFrsgaeGKVX3qRVsN48922M` — already set in `lib.rs`, `Anchor.toml`, and the frontend.
+
+Install [Solana CLI](https://docs.solana.com/cli/install-solana-cli-tools) and [Anchor](https://www.anchor-lang.com/docs/installation), then from `anchor/`:
 
 ```bash
 solana config set --url https://api.devnet.solana.com
+solana airdrop 2
 anchor build
 anchor deploy
 ```
 
-After deploy, update **all 3** of these to the deployed program id:
-
-- `anchor/programs/trustchain_lite/src/lib.rs` (`declare_id!(...)`)
-- `anchor/Anchor.toml` (`[programs.devnet].trustchain_lite`)
-- `frontend/src/lib/solana/constants.ts` (`TRUSTCHAIN_PROGRAM_ID`)
-
-Then copy the generated IDL:
+After `anchor build`, sync the IDL into the app:
 
 - `anchor/target/idl/trustchain_lite.json` → `frontend/src/idl/trustchain_lite.json`
+
+The deploy keypair is under `anchor/target/deploy/` (gitignored). If you clone without `target/`, generate a new program keypair and update the program id in `lib.rs`, `Anchor.toml`, and `frontend/src/lib/solana/constants.ts`.
 
 ## 2) Run the frontend
 

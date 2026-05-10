@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 mod state;
 use state::*;
 
-declare_id!("Tru5tCha1nL1te11111111111111111111111111111");
+declare_id!("3AJ7pp8SVW91iFYhB5LgctFrsgaeGKVX3qRVsN48922M");
 
 #[program]
 pub mod trustchain_lite {
