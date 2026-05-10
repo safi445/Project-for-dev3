@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { WalletReadyState } from "@solana/wallet-adapter-base";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { LAMPORTS_PER_SOL, PublicKey, SystemProgram } from "@solana/web3.js";
 import BN from "bn.js";
@@ -102,6 +102,14 @@ const percent = (released: number, total: number) => {
 
 function readableError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
+  const name = error instanceof Error ? error.name : "";
+  if (
+    name === "WalletNotReadyError" ||
+    message.includes("WalletNotReady") ||
+    message.toLowerCase().includes("wallet not ready")
+  ) {
+    return "Wallet extension is still initializing. Wait a second, refresh if needed, then connect Phantom.";
+  }
   if (message.includes("429") || message.toLowerCase().includes("too many requests")) {
     return "Solana public Devnet faucet is rate limited right now. Wait a few minutes, use the official Solana faucet, or set NEXT_PUBLIC_SOLANA_RPC_URL to a private Devnet RPC endpoint.";
   }
@@ -193,35 +201,95 @@ function KeyLink({ label, value }: { label: string; value: string }) {
   );
 }
 
+/**
+ * Direct Phantom connect — avoids WalletMultiButton + WalletModalProvider, which often breaks
+ * under Next.js/Turbopack (modal context / chunk issues). Single-wallet flow: select → connect.
+ */
 function ClientWalletButton() {
-  const [mounted, setMounted] = useState(false);
+  const { wallets, wallet, connected, connecting, connect, disconnect, select, publicKey } = useWallet();
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
+  const [localError, setLocalError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setMounted(true);
-    }, 0);
+  const phantomEntry = useMemo(
+    () => wallets.find((w) => w.adapter.name === "Phantom"),
+    [wallets],
+  );
 
-    return () => window.clearTimeout(timer);
-  }, []);
+  const handleConnect = useCallback(async () => {
+    setLocalError(null);
+    if (!phantomEntry) {
+      setLocalError("Phantom adapter is missing from the wallet list.");
+      return;
+    }
+
+    const { adapter } = phantomEntry;
+
+    if (adapter.readyState === WalletReadyState.NotDetected) {
+      window.open("https://phantom.app/download", "_blank", "noopener,noreferrer");
+      setLocalError("Install Phantom for your browser, refresh this page, then tap Connect again.");
+      return;
+    }
+
+    try {
+      if (!wallet || wallet.adapter.name !== adapter.name) {
+        await select(adapter.name);
+      }
+      await connect();
+    } catch (e) {
+      setLocalError(readableError(e));
+    }
+  }, [phantomEntry, wallet, select, connect]);
 
   if (!mounted) {
     return (
-      <button
-        type="button"
-        disabled
-        className="wallet-adapter-button wallet-adapter-button-trigger"
-      >
-        Select Wallet
+      <button type="button" disabled className="wallet-adapter-button wallet-adapter-button-trigger">
+        Connect Phantom
       </button>
     );
   }
 
-  return <WalletMultiButton />;
+  if (connected && publicKey) {
+    return (
+      <button
+        type="button"
+        className="wallet-adapter-button wallet-adapter-button-trigger"
+        onClick={() => void disconnect()}
+      >
+        Disconnect
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex max-w-xs flex-col gap-1">
+      <button
+        type="button"
+        disabled={connecting || !phantomEntry}
+        className="wallet-adapter-button wallet-adapter-button-trigger"
+        onClick={() => void handleConnect()}
+      >
+        {connecting ? "Connecting…" : "Connect Phantom"}
+      </button>
+      {localError ? <p className="text-xs leading-snug text-red-300">{localError}</p> : null}
+    </div>
+  );
 }
 
 export function Dashboard() {
   const { connection } = useConnection();
   const wallet = useWallet();
+
+  const rpcHost = useMemo(() => {
+    try {
+      return new URL(connection.rpcEndpoint).host;
+    } catch {
+      return "devnet";
+    }
+  }, [connection.rpcEndpoint]);
 
   const [tab, setTab] = useState<"workbench" | "my-escrows">("workbench");
   const [freelancerAddress, setFreelancerAddress] = useState("");
@@ -522,6 +590,7 @@ export function Dashboard() {
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <Badge tone="brand">Solana Devnet</Badge>
+              <Badge tone="neutral">RPC · {rpcHost}</Badge>
               <Badge>Milestone escrow</Badge>
               <Badge>On-chain reputation</Badge>
             </div>

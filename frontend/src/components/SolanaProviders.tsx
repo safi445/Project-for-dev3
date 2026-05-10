@@ -2,7 +2,6 @@
 
 import { useMemo } from "react";
 import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
-import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 import { PhantomWalletAdapter } from "@solana/wallet-adapter-phantom";
 import { clusterApiUrl } from "@solana/web3.js";
 
@@ -15,8 +14,16 @@ export function SolanaProviders({ children }: { children: React.ReactNode }) {
 
   return (
     <ConnectionProvider endpoint={endpoint}>
-      <WalletProvider wallets={wallets} autoConnect>
-        <WalletModalProvider>{children}</WalletModalProvider>
+      {/* autoConnect off: connect explicitly from UI after Phantom is ready. */}
+      <WalletProvider
+        wallets={wallets}
+        autoConnect={false}
+        onError={(err) => {
+          if (err instanceof Error && err.name === "WalletNotReadyError") return;
+          console.error(err);
+        }}
+      >
+        {children}
       </WalletProvider>
     </ConnectionProvider>
   );
